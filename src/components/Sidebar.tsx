@@ -6,28 +6,13 @@ import { usePathname } from "next/navigation";
 
 export default function Sidebar() {
     const pathname = usePathname();
-    const [sessionSlug, setSessionSlug] = useState("");
-
-    useEffect(() => {
-        const getSlug = () => {
-            const match = document.cookie.match(/sbl_session_slug=([^;]+)/);
-            if (match) {
-                setSessionSlug(match[1]);
-            } else {
-                // If cookie is missing, wait a bit and retry (AuthGuard might be setting it)
-                setTimeout(getSlug, 500);
-            }
-        };
-        getSlug();
-    }, []);
-
     const navItems = [
-        { href: sessionSlug ? `/vault/${sessionSlug}/dashboard` : "#", label: "Dashboard", icon: "📊" },
-        { href: sessionSlug ? `/vault/${sessionSlug}/users` : "#", label: "Users (CRM)", icon: "👥" },
-        { href: sessionSlug ? `/vault/${sessionSlug}/jobs` : "#", label: "Jobs & Forms", icon: "📋" },
-        { href: sessionSlug ? `/vault/${sessionSlug}/chat` : "#", label: "Chat Hub", icon: "💬" },
-        { href: sessionSlug ? `/vault/${sessionSlug}/security` : "#", label: "Vault (Security)", icon: "🔐" },
-        { href: sessionSlug ? `/vault/${sessionSlug}/settings` : "#", label: "Settings", icon: "⚙️" },
+        { href: "/", label: "Dashboard", icon: "📊" },
+        { href: "/users", label: "Users (CRM)", icon: "👥" },
+        { href: "/jobs", label: "Jobs & Forms", icon: "📋" },
+        { href: "/chat", label: "Chat Hub", icon: "💬" },
+        { href: "/security", label: "Security & Firewall", icon: "🔐" },
+        { href: "/settings", label: "Settings", icon: "⚙️" },
     ];
 
     return (

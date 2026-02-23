@@ -34,17 +34,8 @@ export default function AdminAuthGuard({ children }: { children: React.ReactNode
         const { data: { user } } = await supabase.auth.getUser();
 
         if (user && user.email === ADMIN_EMAIL) {
-            // Ensure cookie is in sync with DB slug
-            const { data: profile } = await supabase.from("profiles").select("current_session_slug").eq("id", user.id).single();
-            if (profile?.current_session_slug) {
-                const cookieSlug = document.cookie.match(/sbl_session_slug=([^;]+)/)?.[1];
-                if (cookieSlug !== profile.current_session_slug) {
-                    document.cookie = `sbl_session_slug=${profile.current_session_slug}; path=/; max-age=86400; SameSite=Strict`;
-                }
-            }
-
             if (currentSessionId) {
-                // ... (existing session check)
+                // Verify this session is the active one in DB
                 const { data: sessions } = await supabase
                     .from("login_sessions")
                     .select("session_token, is_active")
@@ -61,26 +52,6 @@ export default function AdminAuthGuard({ children }: { children: React.ReactNode
                     router.push("/");
                 } else {
                     setAuthed(true);
-                    // Master Redirect / Path Correction
-                    if (profile?.current_session_slug) {
-                        const correctSlug = profile.current_session_slug;
-
-                        // 1. Correct if on public pages
-                        if (pathname === "/" || pathname === "/auth") {
-                            router.push(`/vault/${correctSlug}/dashboard`);
-                        }
-
-                        // 2. Correct if on a vault page with WRONG slug
-                        if (pathname.startsWith("/vault/")) {
-                            const pathParts = pathname.split("/");
-                            const urlSlug = pathParts[2];
-                            if (urlSlug !== correctSlug) {
-                                console.log("Correcting invalid session slug in URL...");
-                                const newPath = pathname.replace(`/vault/${urlSlug}`, `/vault/${correctSlug}`);
-                                router.push(newPath);
-                            }
-                        }
-                    }
                 }
             } else {
                 setAuthed(true);
@@ -113,7 +84,6 @@ export default function AdminAuthGuard({ children }: { children: React.ReactNode
         } else if (data.user) {
             // Create new session
             const newSessionId = crypto.randomUUID();
-            const sessionSlug = Math.random().toString(36).substring(2, 10); // 8-char random slug
             localStorage.setItem("sbl_admin_session", newSessionId);
             setSessionId(newSessionId);
 
@@ -126,24 +96,17 @@ export default function AdminAuthGuard({ children }: { children: React.ReactNode
                 is_active: true
             });
 
-            // Update session slug in profiles
-            await supabase.from("profiles").update({ current_session_slug: sessionSlug }).eq("id", data.user.id);
-
-            // Set a secure cookie for the session slug (used by Sidebar/Middleware)
-            document.cookie = `sbl_session_slug=${sessionSlug}; path=/; max-age=86400; SameSite=Strict`;
-
             // Log the successful login
             await supabase.from("security_audit_logs").insert({
                 user_id: data.user.id,
                 subdomain: "admin",
                 event_type: "login_success",
                 user_agent: navigator.userAgent,
-                metadata: { device: "desktop", session_slug: sessionSlug }
+                metadata: { device: "desktop" }
             });
 
             setAuthed(true);
-            // Master redirect to the masked dashboard
-            window.location.href = `/vault/${sessionSlug}/dashboard`;
+            router.push("/");
         }
         setSubmitting(false);
     }
