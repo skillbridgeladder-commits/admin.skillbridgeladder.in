@@ -8,6 +8,8 @@ export default function SecurityTracker() {
     const supabase = createClient();
     const requestCount = useRef(0);
     const lastRequestTime = useRef(Date.now());
+    const geoCache = useRef<{ ip: string; country: string } | null>(null);
+    const loggedEvents = useRef(new Set<string>());
 
     useEffect(() => {
         const getSubdomain = () => {
@@ -22,123 +24,117 @@ export default function SecurityTracker() {
             return "admin";
         };
 
+        // Fetch GeoIP once via our own server-side proxy (no CORS issues)
+        const fetchGeo = async () => {
+            if (geoCache.current) return geoCache.current;
+            try {
+                const res = await fetch("/api/geo");
+                if (res.ok) {
+                    geoCache.current = await res.json();
+                }
+            } catch {
+                // Silently fail
+            }
+            return geoCache.current || { ip: "0.0.0.0", country: "Unknown" };
+        };
+
         const logEvent = async (eventType: string, metadata: any) => {
             try {
-                // GeoIP fetching with timeout & fallback
-                let country = "Unknown";
-                let ip = "0.0.0.0";
-                try {
-                    const controller = new AbortController();
-                    const timeoutId = setTimeout(() => controller.abort(), 2000); // 2s timeout
+                // Deduplicate repetitive events (especially client-side logs)
+                const eventKey = `${eventType}-${JSON.stringify(metadata)}`;
+                if (loggedEvents.current.has(eventKey)) return;
 
-                    const geoRes = await fetch("https://ipapi.co/json/", { signal: controller.signal });
-                    if (geoRes.ok) {
-                        const geoData = await geoRes.json();
-                        country = geoData.country_name || "Unknown";
-                        ip = geoData.ip || "0.0.0.0";
-                    }
-                    clearTimeout(timeoutId);
-                } catch (e) {
-                    console.log("GeoIP service unavailable, using defaults.");
+                // For high-frequency events like 'click', we only log once per minute per target
+                if (eventType === 'click') {
+                    const clickKey = `click-${metadata.id || metadata.text || metadata.tag}`;
+                    if (loggedEvents.current.has(clickKey)) return;
+                    loggedEvents.current.add(clickKey);
+                    setTimeout(() => loggedEvents.current.delete(clickKey), 60000);
+                } else {
+                    loggedEvents.current.add(eventKey);
                 }
 
-                // Ensure we get a user if logged in, otherwise it's an anon visitor
+                const geo = await fetchGeo();
                 const { data: { user } } = await supabase.auth.getUser().catch(() => ({ data: { user: null } }));
 
-                const { data: logData, error: logError } = await supabase.from("security_audit_logs").insert({
+                const { error: logError } = await supabase.from("security_audit_logs").insert({
                     user_id: user?.id || null,
                     subdomain: getSubdomain(),
                     event_type: eventType,
-                    ip_address: ip, // Log the IP explicitly
+                    ip_address: geo.ip,
                     user_agent: navigator.userAgent,
-                    country: country,
+                    country: geo.country,
                     metadata: {
                         ...metadata,
                         path: window.location.pathname,
                         timestamp: new Date().toISOString()
                     }
-                }).select().single();
+                });
 
                 if (!logError && eventType === 'threat_detected') {
-                    // Fetch admin notification email
-                    const { data: settings } = await supabase.from("site_settings").select("notification_email").eq("id", 1).single();
+                    const { data: settings } = await supabase.from("site_settings").select("notification_email").eq("id", 1).maybeSingle();
                     if (settings?.notification_email) {
                         await sendThreatAlert({
                             threatType: metadata.threat_type || "unknown",
-                            ip: ip,
-                            location: country,
+                            ip: geo.ip,
+                            location: geo.country,
                             path: window.location.pathname,
                             adminEmail: settings.notification_email
                         });
                     }
                 }
             } catch (err) {
-                // Silently fail to not interrupt user experience
+                // Passive failure
             }
         };
 
-        // 1. DDoS / Rate Limiting (Client-side detection)
+        // 1. DDoS / Bot detection (Throttled)
         const checkDDoS = () => {
             const now = Date.now();
-            if (now - lastRequestTime.current < 1000) {
+            if (now - lastRequestTime.current < 2000) { // 2s window
                 requestCount.current++;
             } else {
                 requestCount.current = 1;
             }
             lastRequestTime.current = now;
 
-            if (requestCount.current > 10) { // More than 10 events per second
-                logEvent("threat_detected", { threat_type: "ddos_attempt", severity: "critical", note: "High frequency interaction detected" });
+            if (requestCount.current > 15) {
+                logEvent("threat_detected", { threat_type: "bot_activity", severity: "high", note: "Rapid interaction detected" });
+                requestCount.current = 0; // Reset after logging
             }
         };
 
-        // 2. Bot Honeypot detection
-        const honeypotPaths = ["/wp-admin", "/admin-php", "/.env", "/config", "/backup", "/wp-login.php"];
+        // 2. Honeypot paths
+        const honeypotPaths = ["/wp-admin", "/admin-php", "/.env", "/backup", "/wp-login.php"];
         if (honeypotPaths.some(p => window.location.pathname.startsWith(p))) {
-            logEvent("threat_detected", { threat_type: "honeypot_access", severity: "high" });
+            logEvent("threat_detected", { threat_type: "honeypot_access", severity: "critical" });
         }
 
-        // 3. Track Page View
-        logEvent("page_view", { href: window.location.href });
+        // 3. Initial Page View (One per session per path)
+        const pathKey = `view-${window.location.pathname}`;
+        if (!loggedEvents.current.has(pathKey)) {
+            logEvent("page_view", { path: window.location.pathname });
+            loggedEvents.current.add(pathKey);
+        }
 
-        // 4. Track Clicks & Form interactions
+        // 4. Click Tracking (Throttled to interactive elements)
         const handleClick = (e: MouseEvent) => {
-            checkDDoS();
             const target = e.target as HTMLElement;
-            logEvent("click", {
-                tag: target.tagName,
-                id: target.id || null,
-                text: target.innerText?.slice(0, 50).trim() || null,
-                classes: target.className?.toString() || null
-            });
-        };
+            const isInteractive = target.tagName === 'BUTTON' || target.tagName === 'A' || target.tagName === 'INPUT' || target.closest('button') || target.closest('a');
 
-        // Form Analysis Logic
-        const handleInput = (e: Event) => {
-            const target = e.target as HTMLInputElement | HTMLTextAreaElement;
-            if (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA' || target.tagName === 'SELECT') {
-                // Try to find a label or some descriptive text
-                let fieldName = target.name || target.id;
-                if (!fieldName) {
-                    const label = document.querySelector(`label[for="${target.id}"]`) || target.closest('label');
-                    fieldName = label?.textContent?.trim().slice(0, 30) || target.placeholder || "unnamed_field";
-                }
-
-                logEvent("form_interaction", {
-                    field: fieldName,
-                    type: target.type || target.tagName.toLowerCase()
+            if (isInteractive) {
+                checkDDoS();
+                logEvent("click", {
+                    tag: target.tagName,
+                    text: target.innerText?.slice(0, 30).trim() || null,
+                    id: target.id || null
                 });
             }
         };
 
         window.addEventListener("click", handleClick);
-        window.addEventListener("input", handleInput);
-
-        return () => {
-            window.removeEventListener("click", handleClick);
-            window.removeEventListener("input", handleInput);
-        };
-    }, []);
+        return () => window.removeEventListener("click", handleClick);
+    }, [supabase]);
 
     return null;
 }
